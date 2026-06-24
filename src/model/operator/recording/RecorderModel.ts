@@ -64,6 +64,13 @@ class RecorderModel implements IRecorderModel {
     private isCanceledCallingFinished: boolean = false; // mirakurun の stream の終了検知をキャンセルするか
     private eventEmitter = new events.EventEmitter();
 
+    // 分割録画管理
+    private splitFiles: Array<{ videoFileId: apid.VideoFileId; fullPath: string }> = [];
+    private currentSplitIndex: number = 0;
+    private currentBytesWritten: number = 0;
+    private splitBaseFileName: string | null = null;
+    private isSwitchingFile: boolean = false;
+
     private dropLogFileId: apid.DropLogFileId | null = null;
 
     private abortController: AbortController | null = null;
@@ -234,6 +241,8 @@ class RecorderModel implements IRecorderModel {
      * @param needesUnpip: boolean
      */
     private destroyStream(needesUnpip: boolean = true): void {
+        this.isSwitchingFile = false;
+
         // stop stream
         if (this.stream !== null) {
             try {
@@ -294,8 +303,17 @@ class RecorderModel implements IRecorderModel {
         // 時刻指定予約で録画準備中に endAt を変えようとした場合にこのイベントを受信してから変える
         this.eventEmitter.emit(RecorderModel.START_RECORDING_EVENT);
 
-        // 保存先を取得
-        const recPath = await this.recordingUtil.getRecPath(this.reserve, true);
+        // 分割モードの判定
+        const isSplitMode = typeof this.config.recordedFileSplitThreshold !== 'undefined';
+
+        // 分割モードの場合は _001 から開始、非分割モードは従来通り
+        const recPath = await this.recordingUtil.getRecPath(this.reserve, true, isSplitMode ? 0 : undefined);
+
+        // 分割録画の状態を初期化
+        this.splitBaseFileName = recPath.baseFileName;
+        this.currentSplitIndex = 0;
+        this.currentBytesWritten = 0;
+        this.splitFiles = [];
 
         this.log.system.info(`recording: ${this.reserve.id} ${recPath.fullPath}`);
 
@@ -318,6 +336,11 @@ class RecorderModel implements IRecorderModel {
             }
         });
         this.stream.pipe(this.recFile);
+
+        // 分割モードの場合、データ量を監視してファイルを切り替える
+        if (isSplitMode === true) {
+            this.stream.on('data', this.onStreamData);
+        }
 
         // drop checker
         if (this.config.isEnabledDropCheck === true) {
@@ -438,11 +461,16 @@ class RecorderModel implements IRecorderModel {
             videoFile.parentDirectoryName = recPath.parendDir.name;
             videoFile.filePath = path.join(recPath.subDir, recPath.fileName);
             videoFile.type = 'ts';
-            videoFile.name = 'TS';
+            // 分割モードの場合は TS 001、非分割の場合は従来通り TS
+            const isSplitMode = typeof this.config.recordedFileSplitThreshold !== 'undefined';
+            videoFile.name = isSplitMode ? 'TS 001' : 'TS';
             videoFile.recordedId = this.recordedId;
             this.log.system.info(`create video file: ${videoFile.filePath}`);
             this.videoFileId = await this.videoFileDB.insertOnce(videoFile);
             this.videoFileFulPath = recPath.fullPath;
+
+            // 分割ファイル配列に最初のエントリを登録
+            this.splitFiles.push({ videoFileId: this.videoFileId, fullPath: recPath.fullPath });
 
             recorded.videoFiles = [videoFile];
 
@@ -490,6 +518,137 @@ class RecorderModel implements IRecorderModel {
                 });
             }
         });
+    }
+
+    /**
+     * ストリームデータ受信時にバイト数をカウントし、閾値超過でファイルを切り替える
+     */
+    private onStreamData = (chunk: Buffer): void => {
+        if (this.isSwitchingFile === true) {
+            return;
+        }
+
+        this.currentBytesWritten += chunk.length;
+
+        const threshold = this.config.recordedFileSplitThreshold!;
+        if (this.currentBytesWritten >= threshold) {
+            this.isSwitchingFile = true;
+            this.switchToNextFile().catch(err => {
+                this.log.system.error(`switchToNextFile error: ${this.reserve.id}`);
+                this.log.system.error(err);
+                this.isSwitchingFile = false;
+            });
+        }
+    };
+
+    /**
+     * 分割録画の次のファイルへ切り替える
+     */
+    private async switchToNextFile(): Promise<void> {
+        if (this.stream === null || this.recFile === null || this.recordedId === null) {
+            this.isSwitchingFile = false;
+            return;
+        }
+
+        this.log.system.info(
+            `switch to next file: reserveId: ${this.reserve.id}, splitIndex: ${this.currentSplitIndex}`,
+        );
+
+        const oldRecFile = this.recFile;
+
+        // 次のファイルパスを取得
+        this.currentSplitIndex++;
+        const nextRecPath = await this.recordingUtil
+            .getRecPath(
+                this.reserve,
+                true,
+                this.currentSplitIndex,
+                this.splitBaseFileName ?? undefined,
+            )
+            .catch(err => {
+                this.log.system.error(`getRecPath error on switch: ${this.reserve.id}`);
+                this.log.system.error(err);
+                return null;
+            });
+
+        if (nextRecPath === null) {
+            this.currentSplitIndex--;
+            this.isSwitchingFile = false;
+            return;
+        }
+
+        // 新しい WriteStream を作成
+        const newRecFile = fs.createWriteStream(nextRecPath.fullPath, { flags: 'a' });
+        newRecFile.once('error', async err => {
+            this.log.system.error(`split recFile error: ${this.reserve.id}`);
+            this.log.system.error(err);
+            this.isCanceledCallingFinished = true;
+            await this.recFailed(err).catch(e => {
+                this.log.system.fatal(`Unexpected recFailed error on split: ${this.reserve.id}`);
+                this.log.system.fatal(e);
+            });
+        });
+
+        // stream を旧ファイルから切り離し新ファイルへ接続
+        this.stream.unpipe(oldRecFile);
+        this.recFile = newRecFile;
+        this.stream.pipe(newRecFile);
+
+        // 旧ファイルをフラッシュして閉じる
+        await new Promise<void>(resolve => {
+            oldRecFile.end(() => resolve());
+        });
+
+        // 新ファイルの VideoFile レコードを DB に追加
+        if (this.recordedId !== null) {
+            try {
+                const videoFile = new VideoFile();
+                videoFile.parentDirectoryName = nextRecPath.parendDir.name;
+                videoFile.filePath = path.join(nextRecPath.subDir, nextRecPath.fileName);
+                videoFile.type = 'ts';
+                videoFile.name = `TS ${String(this.currentSplitIndex + 1).padStart(3, '0')}`;
+                videoFile.recordedId = this.recordedId;
+                this.log.system.info(`create split video file: ${videoFile.filePath}`);
+                const newVideoFileId = await this.videoFileDB.insertOnce(videoFile);
+                this.splitFiles.push({ videoFileId: newVideoFileId, fullPath: nextRecPath.fullPath });
+                this.videoFileFulPath = nextRecPath.fullPath;
+            } catch (err: any) {
+                this.log.system.error(`add split video file DB error: ${this.reserve.id}`);
+                this.log.system.error(err);
+            }
+        }
+
+        this.currentBytesWritten = 0;
+        this.isSwitchingFile = false;
+
+        this.log.system.info(`switched to next file: ${nextRecPath.fullPath}, reserveId: ${this.reserve.id}`);
+    }
+
+    /**
+     * 全分割ファイルの tmp 移動とサイズ更新を行う
+     */
+    private async handleAllSplitFiles(): Promise<void> {
+        for (let i = 0; i < this.splitFiles.length; i++) {
+            const sf = this.splitFiles[i];
+
+            if (typeof this.config.recordedTmp !== 'undefined') {
+                try {
+                    const newPath = await this.recordingUtil.movingFromTmp(this.reserve, sf.videoFileId);
+                    this.splitFiles[i] = { videoFileId: sf.videoFileId, fullPath: newPath };
+                    if (i === this.splitFiles.length - 1) {
+                        this.videoFileFulPath = newPath;
+                    }
+                } catch (err: any) {
+                    this.log.system.fatal(`movingFromTmp error (split): ${sf.videoFileId}`);
+                    this.log.system.fatal(err);
+                }
+            }
+
+            this.recordingUtil.updateVideoFileSize(sf.videoFileId).catch(err => {
+                this.log.system.error(`update file size error (split): ${sf.videoFileId}`);
+                this.log.system.error(err);
+            });
+        }
     }
 
     /**
@@ -638,23 +797,31 @@ class RecorderModel implements IRecorderModel {
             await this.recordedDB.removeRecording(this.recordedId);
             this.isRecording = false;
 
-            // tmp に録画していた場合は移動する
-            if (typeof this.config.recordedTmp !== 'undefined' && this.videoFileId !== null) {
-                try {
-                    const newVdeoFileFulPath = await this.recordingUtil.movingFromTmp(this.reserve, this.videoFileId);
-                    this.videoFileFulPath = newVdeoFileFulPath;
-                } catch (err: any) {
-                    this.log.system.fatal(`movingFromTmp error: ${this.videoFileId}`);
-                    this.log.system.fatal(err);
+            // tmp 移動とファイルサイズ更新
+            if (this.splitFiles.length > 0) {
+                // 分割録画: 全ファイルをまとめて処理
+                await this.handleAllSplitFiles();
+            } else {
+                // 非分割: 従来通り
+                if (typeof this.config.recordedTmp !== 'undefined' && this.videoFileId !== null) {
+                    try {
+                        const newVdeoFileFulPath = await this.recordingUtil.movingFromTmp(
+                            this.reserve,
+                            this.videoFileId,
+                        );
+                        this.videoFileFulPath = newVdeoFileFulPath;
+                    } catch (err: any) {
+                        this.log.system.fatal(`movingFromTmp error: ${this.videoFileId}`);
+                        this.log.system.fatal(err);
+                    }
                 }
-            }
 
-            // update video file size
-            if (this.videoFileId !== null && this.videoFileFulPath !== null) {
-                this.recordingUtil.updateVideoFileSize(this.videoFileId).catch(err => {
-                    this.log.system.error(`update file size error: ${this.videoFileId}`);
-                    this.log.system.error(err);
-                });
+                if (this.videoFileId !== null && this.videoFileFulPath !== null) {
+                    this.recordingUtil.updateVideoFileSize(this.videoFileId).catch(err => {
+                        this.log.system.error(`update file size error: ${this.videoFileId}`);
+                        this.log.system.error(err);
+                    });
+                }
             }
 
             // drop 情報更新

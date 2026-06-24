@@ -8,10 +8,16 @@ export interface RecFilePathInfo {
     subDir: string; // サブディレクトリ
     fileName: string; // ファイル名 (拡張子付き)
     fullPath: string;
+    baseFileName: string; // サフィックス前の純粋なファイル名
 }
 
 export default interface IRecordingUtilModel {
-    getRecPath(reserve: Reserve, isEnableTmp: boolean): Promise<RecFilePathInfo>;
+    getRecPath(
+        reserve: Reserve,
+        isEnableTmp: boolean,
+        splitIndex?: number,
+        baseFileName?: string,
+    ): Promise<RecFilePathInfo>;
     movingFromTmp(reserve: Reserve, videoFileId: apid.VideoFileId): Promise<string>;
     updateVideoFileSize(videoFileId: apid.VideoFileId): Promise<void>;
     formatFilePathString(format: string, src: Recorded | Reserve): Promise<string>;

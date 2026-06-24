@@ -52,16 +52,23 @@ class RecordingUtilModel implements IRecordingUtilModel {
      *
      * @param reserve: Reserve
      * @param isEnableTmp: 一時保存ディレクトリを使用するか
+     * @param splitIndex: 分割インデックス (0始まり)。指定時は _001 形式のサフィックスを付ける
+     * @param baseFileName: 2ファイル目以降で共通のベース名を再利用する場合に指定
      * @return Promise<RecFilePathInfo> 保存先ファイルパス
      */
-    public async getRecPath(reserve: Reserve, isEnableTmp: boolean): Promise<RecFilePathInfo> {
+    public async getRecPath(
+        reserve: Reserve,
+        isEnableTmp: boolean,
+        splitIndex?: number,
+        baseFileName?: string,
+    ): Promise<RecFilePathInfo> {
         // ロック取得
         const exeId = await this.executeManagementModel.getExecution(
             RecordingUtilModel.GET_REC_PATH_PRIORITY,
             RecordingUtilModel.GET_REC_PATH_LOCK_TIMEOUT,
         );
 
-        return await this._getRecPath(reserve, isEnableTmp).finally(() => {
+        return await this._getRecPath(reserve, isEnableTmp, splitIndex, baseFileName).finally(() => {
             // 必ずロックを開放するようにする
             this.executeManagementModel.unLockExecution(exeId);
         });
@@ -71,9 +78,16 @@ class RecordingUtilModel implements IRecordingUtilModel {
      * 保存先ディレクトリを取得する
      * @param reserve: Reserve
      * @param isEnableTmp: 一時保存ディレクトリを使用するか
+     * @param splitIndex: 分割インデックス (0始まり)
+     * @param baseFileName: 共通ベース名 (2ファイル目以降で指定)
      * @return Promise<RecFilePathInfo> 保存先ファイルパス
      */
-    private async _getRecPath(reserve: Reserve, isEnableTmp: boolean): Promise<RecFilePathInfo> {
+    private async _getRecPath(
+        reserve: Reserve,
+        isEnableTmp: boolean,
+        splitIndex?: number,
+        baseFileName?: string,
+    ): Promise<RecFilePathInfo> {
         // 親ディレクトリ
         let parentDir: RecordedDirInfo | null = null;
         let subDir = ''; // サブディレクトリ
@@ -107,12 +121,17 @@ class RecordingUtilModel implements IRecordingUtilModel {
             subDir = reserve.directory === null ? '' : reserve.directory;
         }
 
-        // ファイル名
-        let fileName = reserve.recordedFormat === null ? this.config.recordedFormat : reserve.recordedFormat;
-        fileName = await this.formatFilePathString(fileName, reserve);
-
-        // 使用禁止文字列置き換え
-        fileName = StrUtil.replaceFileName(fileName);
+        // ベース名の決定
+        let resolvedBaseFileName: string;
+        if (typeof splitIndex !== 'undefined' && typeof baseFileName !== 'undefined') {
+            // 2ファイル目以降: 共通ベース名を再利用
+            resolvedBaseFileName = baseFileName;
+        } else {
+            // 1ファイル目または非分割: フォーマットからファイル名を生成
+            let fileName = reserve.recordedFormat === null ? this.config.recordedFormat : reserve.recordedFormat;
+            fileName = await this.formatFilePathString(fileName, reserve);
+            resolvedBaseFileName = StrUtil.replaceFileName(fileName);
+        }
 
         // サブディレクトリ
         if (subDir.length > 0) {
@@ -138,13 +157,32 @@ class RecordingUtilModel implements IRecordingUtilModel {
             }
         }
 
-        const newFileName = await this.getFileName(parentDir.path, subDir, fileName, this.config.recordedFileExtension);
+        let newFileName: string;
+        if (typeof splitIndex !== 'undefined') {
+            // 分割モード: _001 形式のサフィックス付きファイル名を取得
+            newFileName = await this.getSplitFileName(
+                parentDir.path,
+                subDir,
+                resolvedBaseFileName,
+                this.config.recordedFileExtension,
+                splitIndex,
+            );
+        } else {
+            // 非分割モード: 重複回避のファイル名を取得
+            newFileName = await this.getFileName(
+                parentDir.path,
+                subDir,
+                resolvedBaseFileName,
+                this.config.recordedFileExtension,
+            );
+        }
 
         return {
             parendDir: parentDir,
             subDir: subDir,
             fileName: newFileName,
             fullPath: path.join(parentDir.path, subDir, newFileName),
+            baseFileName: resolvedBaseFileName,
         };
     }
 
@@ -177,6 +215,36 @@ class RecordingUtilModel implements IRecordingUtilModel {
     }
 
     /**
+     * 分割録画用のファイル名を取得する (_001 形式のサフィックス付き)
+     * @param parentDirPath: 親ディレクトリパス
+     * @param subDir: サブディレクトリ
+     * @param baseFileName: ベースファイル名 (拡張子なし)
+     * @param extension: 拡張子
+     * @param splitIndex: 分割インデックス (0始まり → _001 形式)
+     */
+    private async getSplitFileName(
+        parentDirPath: string,
+        subDir: string,
+        baseFileName: string,
+        extension: string,
+        splitIndex: number,
+    ): Promise<string> {
+        const suffix = `_${String(splitIndex + 1).padStart(3, '0')}`;
+        const newFileName = `${baseFileName}${suffix}${extension}`;
+        const fileFullPath = path.join(parentDirPath, subDir, newFileName);
+
+        try {
+            await FileUtil.stat(fileFullPath);
+            throw new Error(`SplitFileAlreadyExists: ${fileFullPath}`);
+        } catch (err: any) {
+            if (err.message && err.message.startsWith('SplitFileAlreadyExists')) {
+                throw err;
+            }
+            return newFileName;
+        }
+    }
+
+    /**
      * recordedTmp にある video を移動する
      * @param reserve: Reserve
      * @param videoFileId: apid.VideoFileId
@@ -193,8 +261,20 @@ class RecordingUtilModel implements IRecordingUtilModel {
             throw new Error('RecordedTmpIsUndefined');
         }
 
-        // 本来の保存先を取得
-        const newRecPath = await this.getRecPath(reserve, false);
+        // ファイル名の _NNN パターンを検出して分割モードか判定する
+        const extension = this.config.recordedFileExtension;
+        const oldBaseName = path.basename(oldVideoFilePath, extension);
+        const splitMatch = oldBaseName.match(/^(.+)_(\d{3})$/);
+
+        let newRecPath: RecFilePathInfo;
+        if (splitMatch !== null) {
+            const baseName = splitMatch[1];
+            const splitIdx = parseInt(splitMatch[2], 10) - 1; // 0始まりに変換
+            newRecPath = await this.getRecPath(reserve, false, splitIdx, baseName);
+        } else {
+            // 本来の保存先を取得
+            newRecPath = await this.getRecPath(reserve, false);
+        }
 
         // rename で移動可能か試す
         let isSuccessRenameFile = false;

@@ -110,6 +110,9 @@ export default interface IConfigFile {
     // 録画一時ディレクトリ
     recordedTmp?: string;
 
+    // 録画ファイル分割サイズ (バイト)。指定時はこのサイズ毎にファイルを分割する
+    recordedFileSplitThreshold?: number;
+
     // 録画履歴保存期間
     recordedHistoryRetentionPeriodDays: number;
 
