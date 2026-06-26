@@ -11,6 +11,7 @@ on:
 env:
     MAIN_DISTRO: debian
     GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/epgstation
+    DH_IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
 
 jobs:
     build:
@@ -41,23 +42,24 @@ jobs:
             - name: Docker tags
               id: docker-tags
               run: |
-                  IMAGE="${{ env.GHCR_IMAGE }}"
+                  GHCR="${{ env.GHCR_IMAGE }}"
+                  DH="${{ env.DH_IMAGE }}"
                   if echo "$GITHUB_REF" | grep -e '^refs/heads/' >/dev/null 2>&1; then
                     GIT_BRANCH=$(echo "$GITHUB_REF" | sed -e 's|^refs/heads/||')
-                    TAGS="$IMAGE:$GIT_BRANCH-${{ matrix.distro }}"
+                    TAGS="$GHCR:$GIT_BRANCH-${{ matrix.distro }},$DH:$GIT_BRANCH-${{ matrix.distro }}"
                     if [ "$MAIN_DISTRO" = "${{ matrix.distro }}" ]; then
-                      TAGS="$TAGS,$IMAGE:$GIT_BRANCH"
+                      TAGS="$TAGS,$GHCR:$GIT_BRANCH,$DH:$GIT_BRANCH"
                     fi
                   else
                     GIT_TAG=$(echo "$GITHUB_REF" | sed -e 's|^refs/tags/||')
-                    TAGS="$IMAGE:$GIT_TAG-${{ matrix.distro }}"
+                    TAGS="$GHCR:$GIT_TAG-${{ matrix.distro }},$DH:$GIT_TAG-${{ matrix.distro }}"
                     if [ "$MAIN_DISTRO" = "${{ matrix.distro }}" ]; then
-                      TAGS="$TAGS,$IMAGE:$GIT_TAG"
+                      TAGS="$TAGS,$GHCR:$GIT_TAG,$DH:$GIT_TAG"
                     fi
                     # Always update latest image tags when a new git tag is created.
-                    TAGS="$TAGS,$IMAGE:${{ matrix.distro }}"
+                    TAGS="$TAGS,$GHCR:${{ matrix.distro }},$DH:${{ matrix.distro }}"
                     if [ "$MAIN_DISTRO" = "${{ matrix.distro }}" ]; then
-                      TAGS="$TAGS,$IMAGE:latest"
+                      TAGS="$TAGS,$GHCR:latest,$DH:latest"
                     fi
                   fi
                   echo "Tags: $TAGS"
@@ -73,6 +75,11 @@ jobs:
                   key: ${{ runner.os }}-buildx-${{ matrix.distro }}-${{ hashFiles('**/package-lock.json') }}
                   restore-keys: |
                       ${{ runner.os }}-buildx-${{ matrix.distro }}-
+            - name: Login to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKERHUB_USER }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
             - name: Login to GitHub Container Registry
               uses: docker/login-action@v3
               with:
